@@ -289,8 +289,9 @@ extension HLSVideoEngine {
                     )
                 }
             }
-        } else if preferBridge && sourceIsAtmos {
-            // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug.
+        } else if preferBridge && sourceIsAtmos && stereoDownmix == nil {
+            // EAC3+JOC always stream-copies; a pre-bridge decision is a codec-table bug (or the host's
+            // stereo mix, which takes the 5.1 bed on purpose).
             EngineLog.emit(
                 "[HLSVideoEngine] WARNING: Atmos source pre-routed to FLAC bridge without stream-copy attempt, Atmos lost. Investigate the codec compatibility table.",
                 category: .session
@@ -298,8 +299,12 @@ extension HLSVideoEngine {
         }
 
         // #731: TrueHD Atmos or DTS:X with object rendering requested. Tried before the channel bridges,
-        // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible).
-        if !forcedDrop, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
+        // which it falls back to on any failure (see buildSpatialAudioProducerIfEligible). The host's
+        // stereo mix wins over it: heights rendered for a stereo route would be mixed away again.
+        let stereoMix = sourceAudioStream.map {
+            Self.bridgesForStereoDownmix(stereoDownmix, channels: $0.pointee.codecpar.pointee.ch_layout.nb_channels)
+        } ?? false
+        if !forcedDrop, !stereoMix, let audioStream = sourceAudioStream, sourceAudioStreamIndex >= 0,
            let prod = buildSpatialAudioProducerIfEligible(
                audioStream: audioStream,
                audioDemuxer: audioDemuxer,
@@ -319,7 +324,8 @@ extension HLSVideoEngine {
             // is pointless, so it stops immediately.
             let firstAttempt = AudioBridge.bridgeEncoder(
                 for: audioBridgeMode,
-                sourceChannels: audioStream.pointee.codecpar.pointee.ch_layout.nb_channels)
+                sourceChannels: audioStream.pointee.codecpar.pointee.ch_layout.nb_channels,
+                stereoDownmix: stereoDownmix)
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -331,7 +337,8 @@ extension HLSVideoEngine {
                         mode: audioBridgeMode,
                         // The first attempt lets the bridge resolve, so a container that under-reports its
                         // channel count still gets the decoder-resolved answer; only the retry is forced.
-                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt
+                        forcedEncoder: attemptIndex == 0 ? nil : encoderAttempt,
+                        stereoDownmix: stereoDownmix
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
@@ -379,6 +386,7 @@ extension HLSVideoEngine {
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
                     let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
                     let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                        + (bridge.isDownmixing ? " (stereo mix with LFE)" : "")
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = pipelineLabel
                     self.audioDelivery = .bridged

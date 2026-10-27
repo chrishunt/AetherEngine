@@ -54,7 +54,11 @@ final class AudioBridge: @unchecked Sendable {
     /// The input is the SOURCE's channel count, never the current output route. Route-dependent bridging
     /// was measured wrong in #34 (AVPlayer downmixes EAC3+JOC natively over A2DP) and removed; this is a
     /// static property of the source, so a route change cannot make it disagree with itself mid-session.
-    static func bridgeEncoder(for mode: Mode, sourceChannels: Int32) -> AVCodecID {
+    ///
+    /// A stereo mix (`StereoDownmix`) of a surround source is FLAC in either mode: it is stereo, and FLAC
+    /// is lossless where EAC3 would be a second lossy pass.
+    static func bridgeEncoder(for mode: Mode, sourceChannels: Int32, stereoDownmix: StereoDownmix? = nil) -> AVCodecID {
+        if stereoDownmix != nil, StereoDownmix.applies(toChannels: sourceChannels) { return AV_CODEC_ID_FLAC }
         switch mode {
         case .lossless:       return AV_CODEC_ID_FLAC
         case .surroundCompat: return sourceChannels > 2 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_FLAC
@@ -221,6 +225,14 @@ final class AudioBridge: @unchecked Sendable {
     private let mode: Mode
     private var resampledFrame: UnsafeMutablePointer<AVFrame>?
 
+    /// The host's stereo mix (`LoadOptions.stereoDownmix`), set when this source has surround to mix.
+    /// swr then only converts format and rate, into interleaved float at the source's own layout, and
+    /// `downmixer` makes the stereo the encoder takes.
+    private var stereoDownmix: StereoDownmix?
+    private var downmixer: StereoDownmixer?
+    /// Whether this bridge mixes to stereo. Settled at init from the source's channel count.
+    var isDownmixing: Bool { stereoDownmix != nil }
+
     /// Encoder PTS counter in encoder time base, incremented by nb_samples/frame. FLAC demands monotonically
     /// increasing PTS in 1/sample_rate units.
     private var nextEncoderPTS: Int64 = 0
@@ -257,11 +269,15 @@ final class AudioBridge: @unchecked Sendable {
     /// The encoder opens at `encoderSampleRate(supported:source:)`, not at the source's rate: E-AC-3 has no
     /// rate above 48 kHz, so a 96 kHz source used to fail `avcodec_open2` and take the session to silent
     /// video-only (#548). swr converts into it either way.
+    ///
+    /// With `stereoDownmix`, a source of more than two channels is mixed to stereo (`StereoDownmix`) and
+    /// encoded as 24-bit FLAC whatever the mode; a stereo or mono source ignores it.
     init(
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        forcedEncoder: AVCodecID? = nil
+        forcedEncoder: AVCodecID? = nil,
+        stereoDownmix: StereoDownmix? = nil
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
@@ -308,7 +324,17 @@ final class AudioBridge: @unchecked Sendable {
         // probe -> garbled audio. The full path is correct; the only genuine failures are XLL frames that
         // residual-code channels without a usable core ("Residual encoded channels are present without core",
         // EINVAL -22), which feed() skips per-packet instead of failing the whole feed (#64).
-        let openRet = avcodec_open2(dec, srcCodec, nil)
+        // A stereo mix decodes Dolby at its dialogue reference with no compression (`StereoDownmix`). The
+        // container's count decides here; an AC-3 family stream always declares it.
+        let declaredChannels = srcCodecpar.pointee.ch_layout.nb_channels
+        var decoderOptions: OpaquePointer?
+        if stereoDownmix != nil, declaredChannels <= 0 || StereoDownmix.applies(toChannels: declaredChannels) {
+            for option in StereoDownmix.decoderOptions(for: srcCodecID) {
+                av_dict_set(&decoderOptions, option.key, option.value, 0)
+            }
+        }
+        let openRet = avcodec_open2(dec, srcCodec, &decoderOptions)
+        av_dict_free(&decoderOptions)
         guard openRet >= 0 else {
             cleanup()
             throw AudioBridgeError.decoderOpenFailed(code: openRet)
@@ -350,14 +376,19 @@ final class AudioBridge: @unchecked Sendable {
         // `.surroundCompat`, FLAC VBR max 8 otherwise. bit_rate is set below once the channel count is capped
         // (EAC3 scales 128 kbps x nChannels per DrHurt on AetherEngine#4: 256 stereo, 768 5.1, and scales
         // further if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
+        // A stereo mix applies only to a source that has surround to mix.
+        if let stereoDownmix, StereoDownmix.applies(toChannels: resolvedChannels) {
+            self.stereoDownmix = stereoDownmix
+        }
         let encoderCodecID = forcedEncoder
-            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels)
+            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels, stereoDownmix: self.stereoDownmix)
         outputCodecID = encoderCodecID
         if encoderCodecID == AV_CODEC_ID_EAC3 {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 32
-        } else if isLosslessSource {
+        } else if isLosslessSource || isDownmixing {
+            // The mix is computed in floating point, so even a lossy source keeps 24 bits of it.
             pcmSampleFmt = AV_SAMPLE_FMT_S32
             pcmBytesPerSample = 4
             pcmBitsPerRawSample = 24
@@ -386,7 +417,8 @@ final class AudioBridge: @unchecked Sendable {
 
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let nChannels: Int32 = isDownmixing
+            ? 2 : min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -399,7 +431,10 @@ final class AudioBridge: @unchecked Sendable {
             + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
-            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
+            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
+            + (self.stereoDownmix.map {
+                " stereoDownmix: LFE \(String(format: "%+.1f", $0.lfeGainDB)) dB per side, limiter at -1 dBFS"
+            } ?? ""),
             category: .session
         )
 
@@ -448,7 +483,7 @@ final class AudioBridge: @unchecked Sendable {
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
         } else {
-            av_channel_layout_default(&inLayout, nChannels)
+            av_channel_layout_default(&inLayout, isDownmixing ? resolvedChannels : nChannels)
         }
         // copy() allocates a channel map for custom-order layouts; uninit the stack struct or that map leaks per session.
         defer { av_channel_layout_uninit(&inLayout) }
@@ -458,17 +493,29 @@ final class AudioBridge: @unchecked Sendable {
         swrInRate = inRate
         av_channel_layout_copy(&swrInLayout, &inLayout)
 
-        let swrRet = swr_alloc_set_opts2(
-            &swrCtx,
-            &enc.pointee.ch_layout,
-            pcmSampleFmt,
-            sampleRate,
-            &inLayout,
-            inFmt,
-            inRate,
-            0,
-            nil
-        )
+        // A stereo mix keeps swr to format and rate, at the source's own layout; the mixer does the rest.
+        let swrRet: Int32
+        if let stereoDownmix {
+            var mixLayout = AVChannelLayout()
+            av_channel_layout_copy(&mixLayout, &inLayout)
+            defer { av_channel_layout_uninit(&mixLayout) }
+            swrRet = swr_alloc_set_opts2(&swrCtx, &mixLayout, AV_SAMPLE_FMT_FLT, sampleRate,
+                                         &inLayout, inFmt, inRate, 0, nil)
+            downmixer = StereoDownmixer(channels: StereoDownmixer.channels(of: &inLayout),
+                                        sampleRate: sampleRate, settings: stereoDownmix)
+        } else {
+            swrRet = swr_alloc_set_opts2(
+                &swrCtx,
+                &enc.pointee.ch_layout,
+                pcmSampleFmt,
+                sampleRate,
+                &inLayout,
+                inFmt,
+                inRate,
+                0,
+                nil
+            )
+        }
         guard swrRet >= 0, swrCtx != nil else {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
@@ -498,8 +545,21 @@ final class AudioBridge: @unchecked Sendable {
     func close() {
         opLock.lock()
         defer { opLock.unlock() }
+        if let mixer = downmixer { logLimiterStats(mixer) }
         cleanup()
         publishLiveBytes()
+    }
+
+    /// How often the stereo mix's limiter had to act this session. A mix that leans on it often is too
+    /// hot, which is worth seeing in the log.
+    private func logLimiterStats(_ mixer: StereoDownmixer) {
+        let stats = mixer.stats
+        let seconds = Double(stats.framesLimited) / Double(max(mixer.sampleRate, 1))
+        EngineLog.emit(
+            "[AudioBridge] stereo mix limiter: \(String(format: "%.2f", seconds)) s limited, deepest "
+            + "\(String(format: "%.1f", 20 * log10(stats.minimumGain))) dB",
+            category: .session
+        )
     }
 
     /// FIFO depth in samples/channel, for the engine memory probe. Steady-state below frame_size (~4608 @48kHz);
@@ -705,6 +765,8 @@ final class AudioBridge: @unchecked Sendable {
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
+        // The mix's filter and limiter hold pre-restart audio too; the latency is taken up again.
+        downmixer?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -732,6 +794,10 @@ final class AudioBridge: @unchecked Sendable {
             while avcodec_receive_frame(dec, sf) >= 0 {
                 try? resampleAndPushIntoFIFO(srcFrame: sf, enc: enc, swr: swr, fifo: fifoPtr)
             }
+        }
+        // 1b. The stereo mix's limiter still holds its look-ahead of the last frames.
+        if let mixer = downmixer {
+            writeStereoToFIFO(mixer.drain(), fifo: fifoPtr)
         }
 
         // 2. Encode the FIFO remainder, including the final partial
@@ -843,6 +909,7 @@ final class AudioBridge: @unchecked Sendable {
             av_audio_fifo_free(f)
             fifo = nil
         }
+        downmixer = nil
     }
 
     // MARK: - Feed
@@ -1036,17 +1103,27 @@ final class AudioBridge: @unchecked Sendable {
 
         let frameFmt = AVSampleFormat(rawValue: frameFmtRaw)
         var scratch: OpaquePointer?
-        let setRet = swr_alloc_set_opts2(
-            &scratch,
-            &enc.pointee.ch_layout,
-            pcmSampleFmt,
-            enc.pointee.sample_rate,
-            &sf.pointee.ch_layout,
-            frameFmt,
-            frameRate,
-            0,
-            nil
-        )
+        let setRet: Int32
+        if isDownmixing {
+            // The mix's input follows the frame's layout; only the stereo it makes is pinned.
+            var mixLayout = AVChannelLayout()
+            av_channel_layout_copy(&mixLayout, &sf.pointee.ch_layout)
+            defer { av_channel_layout_uninit(&mixLayout) }
+            setRet = swr_alloc_set_opts2(&scratch, &mixLayout, AV_SAMPLE_FMT_FLT, enc.pointee.sample_rate,
+                                         &sf.pointee.ch_layout, frameFmt, frameRate, 0, nil)
+        } else {
+            setRet = swr_alloc_set_opts2(
+                &scratch,
+                &enc.pointee.ch_layout,
+                pcmSampleFmt,
+                enc.pointee.sample_rate,
+                &sf.pointee.ch_layout,
+                frameFmt,
+                frameRate,
+                0,
+                nil
+            )
+        }
         let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
@@ -1068,6 +1145,16 @@ final class AudioBridge: @unchecked Sendable {
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
         swrInFmt = frameFmt
         swrInRate = frameRate
+
+        if let stereoDownmix, let old = downmixer {
+            let channels = StereoDownmixer.channels(of: &sf.pointee.ch_layout)
+            if channels != old.channels {
+                // A new layout is a new mix: what was in flight belonged to the old one.
+                downmixer = StereoDownmixer(channels: channels, sampleRate: enc.pointee.sample_rate,
+                                            settings: stereoDownmix, levels: old.levels)
+            }
+            return true
+        }
 
         // .lossless pins the encoder + swr OUTPUT to the codecpar rate/layout at init (the muxer header is
         // already written from it, so it cannot change now). If the decoded frame differs, swr must resample
@@ -1121,6 +1208,11 @@ final class AudioBridge: @unchecked Sendable {
             return
         }
 
+        if let mixer = downmixer {
+            try mixAndPushIntoFIFO(srcFrame: sf, swr: swr, mixer: mixer, outNbSamples: outNbSamples, fifo: fifo)
+            return
+        }
+
         let nChannels = enc.pointee.ch_layout.nb_channels
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
         let bufferCount = isPlanar ? Int(nChannels) : 1
@@ -1162,6 +1254,73 @@ final class AudioBridge: @unchecked Sendable {
                 to: UnsafeMutableRawPointer?.self, capacity: bufferCount
             ) { rebound in
                 av_audio_fifo_write(fifo, rebound, producedSamples)
+            }
+        }
+        if written > 0 {
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
+        }
+    }
+
+    /// The stereo-mix leg of `resampleAndPushIntoFIFO`: swr converts the frame to interleaved float at its
+    /// own layout, the mixer takes the frame's Lo/Ro levels and makes stereo, and that goes into the FIFO
+    /// in the encoder's format.
+    private func mixAndPushIntoFIFO(
+        srcFrame sf: UnsafeMutablePointer<AVFrame>,
+        swr: OpaquePointer,
+        mixer: StereoDownmixer,
+        outNbSamples: Int32,
+        fifo: OpaquePointer
+    ) throws {
+        let sourceChannels = mixer.channels.count
+        var interleaved = [Float](repeating: 0, count: Int(outNbSamples) * sourceChannels)
+        let producedSamples = interleaved.withUnsafeMutableBytes { raw -> Int32 in
+            var out: UnsafeMutablePointer<UInt8>? = raw.baseAddress?.assumingMemoryBound(to: UInt8.self)
+            return withUnsafeMutablePointer(to: &out) { outPtr in
+                withUnsafeMutablePointer(to: &sf.pointee.extended_data) { srcPtr in
+                    let src = UnsafeRawPointer(srcPtr.pointee).assumingMemoryBound(to: UnsafePointer<UInt8>?.self)
+                    return swr_convert(swr, outPtr, outNbSamples, src, sf.pointee.nb_samples)
+                }
+            }
+        }
+        guard producedSamples > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
+        if let levels = DownmixLevels(frame: sf), mixer.adopt(levels) {
+            EngineLog.emit(
+                "[AudioBridge] stereo mix takes the stream's Lo/Ro levels: centre "
+                + "\(String(format: "%.1f", 20 * log10(levels.center))) dB, surround "
+                + "\(String(format: "%.1f", 20 * log10(levels.surround))) dB",
+                category: .session
+            )
+        }
+        let stereo = interleaved.withUnsafeBufferPointer { mixer.process($0.baseAddress!, frames: Int(producedSamples)) }
+        writeStereoToFIFO(stereo, fifo: fifo)
+    }
+
+    /// Interleaved float stereo from the mixer into the FIFO in the encoder's format: 24-bit samples in
+    /// S32 for FLAC, planar float for the EAC3 fallback. The mixer's limiter keeps every sample inside
+    /// full scale, so the conversion never clips.
+    private func writeStereoToFIFO(_ stereo: [Float], fifo: OpaquePointer) {
+        let frames = stereo.count / 2
+        guard frames > 0 else { return }
+        let written: Int32
+        if pcmSampleFmt == AV_SAMPLE_FMT_FLTP {
+            var left = [Float](repeating: 0, count: frames), right = left
+            for i in 0..<frames { left[i] = stereo[2 * i]; right[i] = stereo[2 * i + 1] }
+            written = left.withUnsafeMutableBytes { l in
+                right.withUnsafeMutableBytes { r in
+                    var planes: [UnsafeMutableRawPointer?] = [l.baseAddress, r.baseAddress]
+                    return planes.withUnsafeMutableBufferPointer { av_audio_fifo_write(fifo, $0.baseAddress, Int32(frames)) }
+                }
+            }
+        } else {
+            // Rounded to 24 bits and left-justified, which is how S32 carries bits_per_raw_sample = 24.
+            var samples = stereo.map { Int32(max(-8_388_608, min(8_388_607, (Double($0) * 8_388_608).rounded()))) << 8 }
+            written = samples.withUnsafeMutableBytes { raw in
+                var planes: [UnsafeMutableRawPointer?] = [raw.baseAddress]
+                return planes.withUnsafeMutableBufferPointer { av_audio_fifo_write(fifo, $0.baseAddress, Int32(frames)) }
             }
         }
         if written > 0 {

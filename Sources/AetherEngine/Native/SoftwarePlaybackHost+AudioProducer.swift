@@ -19,8 +19,15 @@ extension SoftwarePlaybackHost {
         }
         func pcm() throws -> (producer: any SoftwareAudioProducing, route: SoftwareAtmosRoute) {
             let decoder = AudioDecoder()
+            decoder.stereoDownmix = stereoDownmix
             try decoder.open(stream: stream)
             return (decoder, .pcm)
+        }
+        // The host's stereo mix wins over the Atmos routes, as on the native route.
+        if HLSVideoEngine.bridgesForStereoDownmix(stereoDownmix, channels: par.pointee.ch_layout.nb_channels) {
+            EngineLog.emit("[SWHost] audio: stereo mix requested, \(par.pointee.ch_layout.nb_channels)ch "
+                           + "decoded to stereo with the LFE", category: .swPlayback)
+            return try pcm()
         }
         guard objectAudioRendering != .off, !isLive else {
             if let note = Self.eac3PCMRouteNote(

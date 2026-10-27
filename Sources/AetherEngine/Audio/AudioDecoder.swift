@@ -49,7 +49,18 @@ final class AudioDecoder: @unchecked Sendable {
     private var configuredInput = ResamplerInputParameters()
 
     private(set) var sampleRate: Int32 = 0
+    /// The channels the renderer gets: the source's, or 2 under a stereo mix.
     private(set) var channels: Int32 = 0
+    /// The channels swr hands over: the source's own, which a stereo mix then takes to 2.
+    private var resampledChannels: Int32 = 0
+
+    /// The host's stereo mix (`LoadOptions.stereoDownmix`), set before `open`. A source with surround is
+    /// then decoded at its own layout and mixed to stereo with its LFE before the renderer sees it.
+    var stereoDownmix: StereoDownmix?
+    private var downmixer: StereoDownmixer?
+    /// Where the mix's next output sample sits on the source clock, so the EOF tail can be stamped when
+    /// nothing else is pending.
+    private var downmixNextPTS: CMTime = .invalid
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -60,6 +71,9 @@ final class AudioDecoder: @unchecked Sendable {
         sampleRate = codecpar.pointee.sample_rate
         channels = codecpar.pointee.ch_layout.nb_channels
         if channels <= 0 || channels > 8 { channels = 2 }
+        resampledChannels = channels
+        // Settled for good from the first frame; this only decides the decoder options below.
+        let mixes = stereoDownmix != nil && StereoDownmix.applies(toChannels: channels)
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
             throw AudioDecoderError.unsupportedCodec
@@ -74,7 +88,16 @@ final class AudioDecoder: @unchecked Sendable {
             throw AudioDecoderError.parameterCopyFailed
         }
 
-        guard avcodec_open2(ctx, codec, nil) >= 0 else {
+        // A stereo mix decodes Dolby at its dialogue reference with no compression (`StereoDownmix`).
+        var options: OpaquePointer?
+        if mixes {
+            for option in StereoDownmix.decoderOptions(for: codecpar.pointee.codec_id) {
+                av_dict_set(&options, option.key, option.value, 0)
+            }
+        }
+        let openRet = avcodec_open2(ctx, codec, &options)
+        av_dict_free(&options)
+        guard openRet >= 0 else {
             throw AudioDecoderError.openFailed
         }
 
@@ -145,11 +168,7 @@ final class AudioDecoder: @unchecked Sendable {
         // first frame and again after a mid-stream format change tore the context down (#452).
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
-        if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
-
-        var outLayout = AVChannelLayout()
-        // #401: this is the order the stamped layout has to name, so both come from one place.
-        makeResamplerOutputLayout(channels, into: &outLayout)
+        if frameChannels > 0 && frameChannels <= 8 { resampledChannels = frameChannels }
 
         // Input layout: frame's if valid, else a synthesised default. Key for TrueHD 7.1 (the frame has it right
         // after decoding even when codecpar didn't).
@@ -157,8 +176,24 @@ final class AudioDecoder: @unchecked Sendable {
         if frame.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &frame.pointee.ch_layout)
         } else {
-            av_channel_layout_default(&inLayout, channels)
+            av_channel_layout_default(&inLayout, resampledChannels)
         }
+
+        var outLayout = AVChannelLayout()
+        let mix = stereoDownmix.flatMap { StereoDownmix.applies(toChannels: resampledChannels) ? $0 : nil }
+        if let mix {
+            // The mix reads the source's own layout; swr only converts format and rate.
+            av_channel_layout_copy(&outLayout, &inLayout)
+            downmixer = StereoDownmixer(channels: StereoDownmixer.channels(of: &outLayout),
+                                        sampleRate: sampleRate, settings: mix)
+            channels = 2
+        } else {
+            // #401: this is the order the stamped layout has to name, so both come from one place.
+            makeResamplerOutputLayout(resampledChannels, into: &outLayout)
+            downmixer = nil
+            channels = resampledChannels
+        }
+        downmixNextPTS = .invalid
         // copy() allocates a channel map for custom-order layouts; uninit the stack structs or that map leaks per init.
         defer {
             av_channel_layout_uninit(&inLayout)
@@ -209,6 +244,9 @@ final class AudioDecoder: @unchecked Sendable {
         avcodec_flush_buffers(ctx)
         // Drop the coalesced samples; after a seek they'd be at the wrong PTS anyway.
         resetPending()
+        // So does the stereo mix's filter and limiter.
+        downmixer?.reset()
+        downmixNextPTS = .invalid
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
         #if DEBUG
@@ -243,6 +281,15 @@ final class AudioDecoder: @unchecked Sendable {
                 }
             }
         }
+        // The stereo mix's limiter still holds its look-ahead of the last frames.
+        if let mixer = downmixer {
+            let tail = mixer.drain()
+            if !tail.isEmpty {
+                if pendingSampleCount == 0 { pendingStartPTS = downmixNextPTS }
+                tail.withUnsafeBytes { pendingBytes.append(contentsOf: $0) }
+                pendingSampleCount += tail.count / 2
+            }
+        }
         // Force-emit whatever is left below the coalescing threshold (emitPending only needs > 0 samples).
         if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
         return results
@@ -251,6 +298,15 @@ final class AudioDecoder: @unchecked Sendable {
     func close() {
         stateLock.lock()
         defer { stateLock.unlock() }
+        if let mixer = downmixer {
+            let stats = mixer.stats
+            EngineLog.emit(
+                "[AudioDecoder] stereo mix limiter: "
+                + "\(String(format: "%.2f", Double(stats.framesLimited) / Double(max(mixer.sampleRate, 1)))) s limited, "
+                + "deepest \(String(format: "%.1f", 20 * log10(stats.minimumGain))) dB",
+                category: .swPlayback)
+            downmixer = nil
+        }
         if codecContext != nil {
             avcodec_free_context(&codecContext)
         }
@@ -327,7 +383,7 @@ final class AudioDecoder: @unchecked Sendable {
         let maxOutputSamples = Int(swr_get_out_samples(swr, frame.pointee.nb_samples))
         guard maxOutputSamples > 0 else { return }
 
-        let bytesPerSample = Int(channels) * 4
+        let bytesPerSample = Int(resampledChannels) * 4
         let bufferSize = maxOutputSamples * bytesPerSample
         let tempBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
         defer { tempBuffer.deallocate() }
@@ -353,6 +409,11 @@ final class AudioDecoder: @unchecked Sendable {
         #endif
         guard convertedSamples > 0 else { return }
 
+        if let mixer = downmixer {
+            appendMix(of: frame, mixer: mixer, samples: tempBuffer, count: Int(convertedSamples))
+            return
+        }
+
         // First frame in a new accumulator captures the PTS; subsequent frames only extend the buffer.
         if pendingSampleCount == 0 {
             pendingStartPTS = SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase)
@@ -360,6 +421,32 @@ final class AudioDecoder: @unchecked Sendable {
 
         pendingBytes.append(tempBuffer, count: Int(convertedSamples) * bytesPerSample)
         pendingSampleCount += Int(convertedSamples)
+    }
+
+    /// The stereo-mix leg of `appendFrameToPending`. The mix runs its limiter's latency behind its input,
+    /// so what comes out while this frame goes in starts `outputLag` samples before the frame does.
+    private func appendMix(of frame: UnsafeMutablePointer<AVFrame>, mixer: StereoDownmixer,
+                           samples: UnsafeMutablePointer<UInt8>, count: Int) {
+        if let levels = DownmixLevels(frame: frame), mixer.adopt(levels) {
+            EngineLog.emit(
+                "[AudioDecoder] stereo mix takes the stream's Lo/Ro levels: centre "
+                + "\(String(format: "%.1f", 20 * log10(levels.center))) dB, surround "
+                + "\(String(format: "%.1f", 20 * log10(levels.surround))) dB",
+                category: .swPlayback)
+        }
+        let lag = mixer.outputLag
+        let stereo = samples.withMemoryRebound(to: Float.self, capacity: count * mixer.channels.count) {
+            mixer.process($0, frames: count)
+        }
+        let produced = stereo.count / 2
+        guard produced > 0 else { return }
+        let start = CMTimeSubtract(
+            SourceTimestampBounds.cmTime(ticks: frame.pointee.pts, timeBase: timeBase),
+            CMTime(value: Int64(lag), timescale: sampleRate))
+        if pendingSampleCount == 0 { pendingStartPTS = start }
+        stereo.withUnsafeBytes { pendingBytes.append(contentsOf: $0) }
+        pendingSampleCount += produced
+        downmixNextPTS = start.isValid ? CMTimeAdd(start, CMTime(value: Int64(produced), timescale: sampleRate)) : .invalid
     }
 
     /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.

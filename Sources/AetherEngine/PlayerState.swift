@@ -595,6 +595,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
+    /// Mix every surround track to stereo in the engine, keeping the LFE, for a stereo system with real
+    /// bass behind a route that takes two channels (see `StereoDownmix`). `nil` (default) leaves surround
+    /// to the system, whose stereo mix drops the LFE. Set, a track of more than two channels plays as
+    /// 24-bit stereo FLAC on both the native and the software route, ahead of `audioBridgeMode` and
+    /// `objectAudioRendering`; stereo and mono tracks are untouched.
+    public var stereoDownmix: StereoDownmix?
+
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
     /// packing a container declares; `.sideBySide` / `.overUnder` say what the file's name alone says (a
@@ -1056,6 +1063,7 @@ public struct LoadOptions: Sendable, Equatable {
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        stereoDownmix: StereoDownmix? = nil,
         stereoPresentation: StereoPresentation = .automatic,
         isLive: Bool = false,
         audioOnly: Bool = false,
@@ -1116,6 +1124,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.stereoDownmix = stereoDownmix
         self.stereoPresentation = stereoPresentation
         self.isLive = isLive
         self.audioOnly = audioOnly

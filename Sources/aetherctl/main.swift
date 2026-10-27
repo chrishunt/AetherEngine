@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] [--stereo-downmix] [--stereo-downmix-lfe DB] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
@@ -1169,6 +1169,11 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
     let serveObjectAudioRendering = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
+    // LoadOptions.stereoDownmix: surround mixed to stereo FLAC with the LFE, at the cinema level or
+    // `--stereo-downmix-lfe DB` per side. Pull the audio off the served playlist with ffmpeg to measure it.
+    let serveLFEGain = takeDoubleFlag("--stereo-downmix-lfe", from: &rest)
+    let serveStereoDownmix: StereoDownmix? = takeFlag("--stereo-downmix", from: &rest) || serveLFEGain != nil
+        ? StereoDownmix(lfeGainDB: serveLFEGain ?? StereoDownmix.cinemaLFEGainDB) : nil
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")
@@ -1192,7 +1197,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
                  audioDelayMs: serveAudioDelayMs, iFrames: serveIFrames,
                  objectAudioRendering: serveObjectAudioRendering,
                  // `--audio-index` (parsed once above, shared with customio): serve that source stream.
-                 audioStreamIndex: customAudioIndex, stereo: serveStereo)
+                 audioStreamIndex: customAudioIndex, stereo: serveStereo,
+                 stereoDownmix: serveStereoDownmix)
     case "validate":
         exit(runValidate(url: url, dvModeAvailable: dvModeAvailable, forceDVWithoutDisplay: forceDV,
                          dolbyVisionHandling: dvHandling))

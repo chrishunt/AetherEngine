@@ -1112,6 +1112,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        stereoDownmix: StereoDownmix? = nil,
         stereoPresentation: StereoPresentation = .automatic,
         stereoOnAnySystem: Bool = false,
         isLiveSession: Bool = false,
@@ -1170,6 +1171,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.stereoDownmix = stereoDownmix
         self.stereoPresentation = stereoPresentation
         self.stereoOnAnySystem = stereoOnAnySystem
         self.isLiveSession = isLiveSession
@@ -1296,6 +1298,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
+
+    /// The host's stereo mix (`LoadOptions.stereoDownmix`). Set, a surround track is bridged and mixed to
+    /// stereo whatever its codec, ahead of both settings above.
+    let stereoDownmix: StereoDownmix?
+
+    /// Whether this session mixes a track of `channels` to stereo in the bridge instead of stream-copying
+    /// or rendering it.
+    static func bridgesForStereoDownmix(_ downmix: StereoDownmix?, channels: Int32) -> Bool {
+        downmix != nil && StereoDownmix.applies(toChannels: channels)
+    }
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
@@ -2141,6 +2153,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                 for: audioBridgeMode,
                                 sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
                           + " re-encode",
+                    category: .session
+                )
+            } else if Self.bridgesForStereoDownmix(stereoDownmix, channels: acpForHE.ch_layout.nb_channels) {
+                // The host mixes surround to stereo itself (`StereoDownmix`): the system's own mix of a
+                // stream-copied track would drop the LFE.
+                bridgePreferred = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: codec=\(compat) \(acpForHE.ch_layout.nb_channels)ch, stereo mix "
+                    + "requested: decoding + stereo FLAC with the LFE instead of stream-copy",
                     category: .session
                 )
             } else if compat != .unsupported {

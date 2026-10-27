@@ -293,6 +293,9 @@ final class SoftwarePlaybackHost {
     /// The host's object-audio setting, set before `load`. Anything but `.off` lets Atmos tracks reach
     /// the renderer as Atmos instead of as the PCM decode of their core.
     var objectAudioRendering: ObjectAudioRendering = .off
+    /// The host's stereo mix (`LoadOptions.stereoDownmix`), set before `load`. Set, a surround track is
+    /// decoded and mixed to stereo with its LFE, ahead of the Atmos routes.
+    var stereoDownmix: StereoDownmix?
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
     private var vodPacketReadAhead: SoftwarePacketReadAhead?

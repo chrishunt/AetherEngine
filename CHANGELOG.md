@@ -10,7 +10,22 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`LoadOptions.stereoDownmix` mixes surround to stereo in the engine and keeps the LFE.** A host
+  whose output is a stereo system with real bass behind a two-channel route (an Apple TV into a TV's
+  optical output and a stereo amplifier with subwoofers) heard every film without its subwoofer
+  channel: tvOS mixes a stream-copied Dolby track, and the bridge's multichannel FLAC, to stereo
+  without an LFE term, as the standard Lo/Ro mix has none. Measured on an Apple TV 4K with 5.1 test
+  tones: nothing from the LFE on either route. With `StereoDownmix` set, every track of more than two
+  channels is decoded and mixed here, including the AAC, AC-3 and E-AC-3 that otherwise stream-copy,
+  and plays as 24-bit stereo FLAC on the native and the software route: BS.775 / A/52 Lo/Ro levels
+  (the stream's own where a Dolby stream carries them), the LFE through a 120 Hz fourth-order
+  low-pass into both sides at `lfeGainDB` (+4 dB per side by default, the cinema +10 dB once the two
+  sides sum), the A/52 5.1 normalization, Dolby decoded at the -31 dB dialogue reference without
+  compression, and a look-ahead limiter at -1 dBFS whose latency is compensated. It takes precedence
+  over `objectAudioRendering`; stereo and mono tracks are untouched. `aetherctl serve --stereo-downmix
+  [--stereo-downmix-lfe DB]` serves it. See `docs/api.md`.
 
 ## [7.49.0] - 2026-10-27
 

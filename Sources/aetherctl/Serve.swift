@@ -8,7 +8,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0, iFrames: Bool = false,
               objectAudioRendering: ObjectAudioRendering = .off, audioStreamIndex: Int32? = nil,
-              stereo: StereoPresentation? = nil) -> Never {
+              stereo: StereoPresentation? = nil, stereoDownmix: StereoDownmix? = nil) -> Never {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -28,6 +28,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     if case .apac(let layout) = objectAudioRendering { flagSuffix += " [--atmos-bed \(layout.rawValue)]" }
     if let audioStreamIndex { flagSuffix += " [--audio-index \(audioStreamIndex)]" }
     if let stereo { flagSuffix += " [--stereo \(stereo)]" }
+    if let stereoDownmix { flagSuffix += " [--stereo-downmix-lfe \(stereoDownmix.lfeGainDB)]" }
     print(EngineLog.redacted("aetherctl serve: \(url.absoluteString)\(flagSuffix)"))
     print("")
 
@@ -41,6 +42,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
         dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url),
         audioSourceStreamIndexOverride: audioStreamIndex,
         objectAudioRendering: objectAudioRendering,
+        stereoDownmix: stereoDownmix,
         // nil (no flag) is the session as this system gets it; a flag resolves it as visionOS would.
         stereoPresentation: stereo ?? .automatic,
         stereoOnAnySystem: stereo != nil
